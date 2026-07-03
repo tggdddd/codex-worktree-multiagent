@@ -70,7 +70,7 @@ notes:
 状态约定：
 - `ready`：可分发给 worker。
 - `in_progress`：worker 正在实现。
-- `merge_pending`：worker 已实现/提交，但目标分支当前有 merge lock、活动 merge 或其他集成占用，等待 integrator 或后续 worker 串行合并。
+- `merge_pending`：worker 已实现/提交，但用户要求停止等待或确认需要后续 integrator 接手；短暂遇到同目标 `merging` / merge lock 时应继续等待，不应立刻进入该状态。
 - `merging`：某个 worker/integrator 已获得该目标分支的 merge lock，正在合并。主 Agent 不得再调用任何会合并同一目标分支的 Agent。
 - `merged`：worker 已自行合并目标分支。
 - `blocked`：worker 或 integrator 报告阻塞。
@@ -93,8 +93,8 @@ while (用户需求仍可能有未覆盖面) {
 关键规则：
 - 如果没有 ready 条目，继续调用 explorer 探索更多需求面。
 - 如果有 ready 条目，调用 worker 后立刻继续调用 explorer 或分发下一个 ready 条目。
-- 主 Agent 只用会话内 `called_req_ids` 防止重复调用；需求 md 状态由 worker 自己更新为 `in_progress`、`merged` 或 `blocked`。
-- 如果需求 md 中已经存在同一 `merge_target` 的 `merging` 条目，主 Agent 不得再调用新的 integrator 处理同一目标分支；可以继续调用 explorer，或调用只实现不立即合并的 worker。
+- 主 Agent 只用会话内 `called_req_ids` 防止重复调用；需求 md 状态由 worker 自己更新为 `in_progress`、`merging`、`merged`、`merge_pending` 或 `blocked`。
+- 如果需求 md 中已经存在同一 `merge_target` 的 `merging` 条目，主 Agent 不得再调用新的 integrator 处理同一目标分支；可以继续调用 explorer，或分发 worker 并明确要求其实现提交后等待该 `merging`/lock 清除再合并。
 - 如果需求 md 中存在 `merge_pending` 条目，主 Agent 最多只调用一个 `worktree-integrator` 处理同一 `merge_target`。调用后继续探索，不再为同一目标启动第二个 integrator。
 - 看到 `Waiting for <agent-id>`、`waitFor`、超时、无回传，都不改变主 Agent 行为：继续调用其他 Agent。
 - 主 Agent 不需要知道 worker 是否完成，除非后续要把 worker 输出交给 integrator 修复合并阻塞。
@@ -141,7 +141,7 @@ while (用户需求仍可能有未覆盖面) {
 - 建议 worktree/branch 名称。
 - merge_target；如果 unknown，要求 worker 自行安全识别并报告。
 - 验收点和命令。
-- 明确要求 worker 自行更新需求 md 状态、实现、验证、提交，并按 merge lock 协议串行合并目标分支；如果目标分支已有活动 merge/lock，则写入 `merge_pending`，不得开始第二个 merge。
+- 明确要求 worker 自行更新需求 md 状态、实现、验证、提交，并按 merge lock 协议串行合并目标分支；如果目标分支已有活动 merge/lock，则等待清除后继续拿锁并合并，不得开始第二个 merge，也不得因此立刻结束为 `merge_pending`。
 
 调用 `worktree-integrator` 只用于：
 - worker 已实现并提交，但自合并阻塞。

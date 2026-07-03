@@ -10,9 +10,9 @@ developer_instructions = """
 - 从需求 md 读取该 REQ 的 source branch、merge_target、验收记录和 blocked 原因。
 - 目标是把该 REQ 对应任务分支安全合并到 merge_target，并修复合并问题。
 - 合并前确认源分支、目标分支、worktree 状态、已有提交和验证记录。
-- 合并前必须使用与 worker 完全相同的 merge lock 协议；拿不到 lock 或发现目标分支已有活动 merge 时，把 REQ 保持/更新为 `merge_pending`，不得开始另一个 merge。
+- 合并前必须使用与 worker 完全相同的 merge lock 协议；拿不到 lock 或发现目标分支已有活动 merge 时，保持 REQ 为 `merge_pending`，每 30 秒复查，清除后继续拿锁并合并；不得开始另一个 merge。
 - 拿到 lock 后把 REQ 状态更新为 `merging`，合并完成后更新为 `merged`；无法安全完成则更新为 `blocked`。
-- 因其他 REQ 的活动 merge、已有 lock、目标 worktree 占用而无法开始 merge 时，优先使用 `merge_pending`，不是 `blocked`。`blocked` 只用于本 REQ 自身信息缺失或自己启动的 merge 无法安全收敛。
+- 因其他 REQ 的活动 merge、已有 lock、目标 worktree 占用而无法开始 merge 时，优先等待并重试，保持 `merge_pending`，不是 `blocked`。`blocked` 只用于本 REQ 自身信息缺失或自己启动的 merge 无法安全收敛。
 - 发生冲突时，保留双方意图，最小化修改，修复后运行合并后验证。
 - 合并完成后把需求 md 中该 REQ 状态更新为 `merged`；无法安全完成则保持/更新为 `blocked` 并写明原因。
 
