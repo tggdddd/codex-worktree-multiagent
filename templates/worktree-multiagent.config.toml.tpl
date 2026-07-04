@@ -3,6 +3,16 @@ approval_policy = "on-request"
 sandbox_mode = "workspace-write"
 model_instructions_file = "{{MODEL_INSTRUCTIONS_FILE_TOML}}"
 
+[[hooks.SessionStart]]
+matcher = "startup|resume"
+
+[[hooks.SessionStart.hooks]]
+type = "command"
+command = "node \"{{STATE_RECOVERY_SCRIPT_TOML}}\""
+commandWindows = "if (Get-Command node -ErrorAction SilentlyContinue) { node \"{{STATE_RECOVERY_SCRIPT_TOML}}\" }"
+timeout = 10
+statusMessage = "Recovering worktree REQ state..."
+
 [agents]
 max_threads = 24
 max_depth = 1

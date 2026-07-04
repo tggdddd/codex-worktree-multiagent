@@ -53,6 +53,7 @@ $CODEX_HOME/instructions/worktree-multiagent-base.md
 $CODEX_HOME/agents/worktree-explorer.toml
 $CODEX_HOME/agents/worktree-worker.toml
 $CODEX_HOME/agents/worktree-integrator.toml
+$CODEX_HOME/worktree-multiagent/hooks/recover-requirement-state.js
 ```
 
 如果目标文件已存在，默认会先备份为：
@@ -91,6 +92,8 @@ chmod +x ./uninstall.sh
 ```text
 WORKTREE_MULTIAGENT_REQUIREMENTS.md
 ```
+
+profile 带一个 `SessionStart` hook：启动或 resume 时会把异常中断遗留的 `in_progress` 恢复为 `ready`，把陈旧的 `merging` 恢复为 `merge_pending`，避免队列永久卡住。首次运行时按 Codex 的 hook trust 提示授权即可。
 
 ## 设计边界
 

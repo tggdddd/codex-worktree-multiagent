@@ -13,7 +13,8 @@ $Targets = @(
     (Join-Path $CodexHome "instructions\worktree-multiagent-base.md"),
     (Join-Path $CodexHome "agents\worktree-explorer.toml"),
     (Join-Path $CodexHome "agents\worktree-worker.toml"),
-    (Join-Path $CodexHome "agents\worktree-integrator.toml")
+    (Join-Path $CodexHome "agents\worktree-integrator.toml"),
+    (Join-Path $CodexHome "worktree-multiagent\hooks\recover-requirement-state.js")
 )
 
 foreach ($Target in $Targets) {

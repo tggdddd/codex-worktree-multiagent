@@ -9,6 +9,7 @@ targets=(
   "$CODEX_HOME/agents/worktree-explorer.toml"
   "$CODEX_HOME/agents/worktree-worker.toml"
   "$CODEX_HOME/agents/worktree-integrator.toml"
+  "$CODEX_HOME/worktree-multiagent/hooks/recover-requirement-state.js"
 )
 
 for target in "${targets[@]}"; do

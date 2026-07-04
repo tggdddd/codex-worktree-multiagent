@@ -75,6 +75,8 @@ notes:
 - `merged`：worker 已自行合并目标分支。
 - `blocked`：worker 或 integrator 报告阻塞。
 
+启动/恢复 hook 会在 `startup|resume` 时修复异常中断遗留状态：无活动证据的 `in_progress` 会恢复为 `ready`，无活动证据或陈旧 lock 的 `merging` 会恢复为 `merge_pending`，并写入 notes。
+
 ## 主 Agent 循环
 
 主 Agent 的循环固定为：
@@ -94,6 +96,7 @@ while (用户需求仍可能有未覆盖面) {
 - 如果没有 ready 条目，继续调用 explorer 探索更多需求面。
 - 如果有 ready 条目，调用 worker 后立刻继续调用 explorer 或分发下一个 ready 条目。
 - 主 Agent 只用会话内 `called_req_ids` 防止重复调用；需求 md 状态由 worker 自己更新为 `in_progress`、`merging`、`merged`、`merge_pending` 或 `blocked`。
+- 如果 SessionStart hook 汇报已恢复状态，立刻重新读取需求 md；恢复成 `ready` 的 REQ 可重新分发，恢复成 `merge_pending` 的 REQ 按 integrator 规则处理。
 - 如果需求 md 中已经存在同一 `merge_target` 的 `merging` 条目，主 Agent 不得再调用新的 integrator 处理同一目标分支；可以继续调用 explorer，或分发 worker 并明确要求其实现提交后等待该 `merging`/lock 清除再合并。
 - 如果需求 md 中存在 `merge_pending` 条目，主 Agent 最多只调用一个 `worktree-integrator` 处理同一 `merge_target`。调用后继续探索，不再为同一目标启动第二个 integrator。
 - 看到 `Waiting for <agent-id>`、`waitFor`、超时、无回传，都不改变主 Agent 行为：继续调用其他 Agent。

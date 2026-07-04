@@ -43,21 +43,25 @@ function Convert-ToTomlStringContent {
 New-Item -ItemType Directory -Force -Path $CodexHome | Out-Null
 New-Item -ItemType Directory -Force -Path (Join-Path $CodexHome "instructions") | Out-Null
 New-Item -ItemType Directory -Force -Path (Join-Path $CodexHome "agents") | Out-Null
+New-Item -ItemType Directory -Force -Path (Join-Path $CodexHome "worktree-multiagent\hooks") | Out-Null
 
 $InstructionDest = Join-Path $CodexHome "instructions\worktree-multiagent-base.md"
 $ExplorerDest = Join-Path $CodexHome "agents\worktree-explorer.toml"
 $WorkerDest = Join-Path $CodexHome "agents\worktree-worker.toml"
 $IntegratorDest = Join-Path $CodexHome "agents\worktree-integrator.toml"
+$RecoveryHookDest = Join-Path $CodexHome "worktree-multiagent\hooks\recover-requirement-state.js"
 $ProfileDest = Join-Path $CodexHome "worktree-multiagent.config.toml"
 
 Copy-TemplateFile -Source (Join-Path $TemplateRoot "instructions\worktree-multiagent-base.md") -Destination $InstructionDest
 Copy-TemplateFile -Source (Join-Path $TemplateRoot "agents\worktree-explorer.toml") -Destination $ExplorerDest
 Copy-TemplateFile -Source (Join-Path $TemplateRoot "agents\worktree-worker.toml") -Destination $WorkerDest
 Copy-TemplateFile -Source (Join-Path $TemplateRoot "agents\worktree-integrator.toml") -Destination $IntegratorDest
+Copy-TemplateFile -Source (Join-Path $TemplateRoot "hooks\recover-requirement-state.js") -Destination $RecoveryHookDest
 
 $Template = Get-Content -Raw -Encoding UTF8 (Join-Path $TemplateRoot "worktree-multiagent.config.toml.tpl")
 $EscapedInstructionPath = Convert-ToTomlStringContent -Value $InstructionDest
-$Profile = $Template.Replace("{{MODEL_INSTRUCTIONS_FILE_TOML}}", $EscapedInstructionPath)
+$EscapedRecoveryHookPath = Convert-ToTomlStringContent -Value $RecoveryHookDest
+$Profile = $Template.Replace("{{MODEL_INSTRUCTIONS_FILE_TOML}}", $EscapedInstructionPath).Replace("{{STATE_RECOVERY_SCRIPT_TOML}}", $EscapedRecoveryHookPath)
 Backup-IfExists -Path $ProfileDest
 $Utf8NoBom = [System.Text.UTF8Encoding]::new($false)
 [System.IO.File]::WriteAllText($ProfileDest, $Profile, $Utf8NoBom)
