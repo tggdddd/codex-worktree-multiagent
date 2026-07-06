@@ -7,8 +7,9 @@
 - 先调用 `worktree-explorer` 探索需求。
 - `worktree-explorer` 探索到需求后写入需求 md，并继续探索。
 - 主 Agent 从需求 md 中读取 ready 需求，然后调用 `worktree-worker` 实现。
-- `worktree-worker` 自行实现、验证、提交、合并到目标主分支，并修复合并问题。
+- `worktree-worker` 自行实现、验证、提交、记录可恢复字段、合并到目标主分支，并修复合并问题。
 - 主 Agent 分发后继续调用 explorer 或 worker，不等待、不验收、不合并、不修复冲突。
+- SubAgent 正常结束由 `SubagentStop` hook 记录到需求 md；启动/恢复异常只由 `SessionStart` 兜底修复。
 
 所有文件读写必须使用 UTF-8。
 
@@ -59,6 +60,16 @@ summary: <可实现需求摘要>
 scope: <涉及模块/业务链路>
 paths: <建议路径范围>
 merge_target: <目标主分支，未知则写 unknown>
+owner_agent: <当前接管的 SubAgent id，未接管时留空或省略>
+agent_type: <worktree-worker 或 worktree-integrator>
+started_at: <ISO 时间>
+heartbeat_at: <ISO 时间>
+worktree_path: <实际 git worktree 目录>
+source_branch: <实现分支>
+source_commit: <实现提交>
+validation: <最后一次关键验证命令和结果>
+lock_owner: <持有 merge lock 的 Agent id>
+last_agent_message: <最后一次 SubAgent 交接摘要>
 acceptance:
 - <验收点或命令>
 constraints:
@@ -69,13 +80,18 @@ notes:
 
 状态约定：
 - `ready`：可分发给 worker。
-- `in_progress`：worker 正在实现。
-- `merge_pending`：worker 已实现/提交，但用户要求停止等待或确认需要后续 integrator 接手；短暂遇到同目标 `merging` / merge lock 时应继续等待，不应立刻进入该状态。
+- `in_progress`：SubAgent 正在实现，hook/ledger 应记录 `owner_agent`、`agent_type`、`started_at`、`heartbeat_at`。
+- `merge_waiting`：已实现、验证、提交，`worktree_path` / `source_branch` / `source_commit` / `validation` 已记录，SubAgent 仍在运行并等待同目标 merge lock 或活动 merge 清除；SubAgentStop 不应把最终状态落成 `merge_waiting`。
 - `merging`：某个 worker/integrator 已获得该目标分支的 merge lock，正在合并。主 Agent 不得再调用任何会合并同一目标分支的 Agent。
+- `merge_pending`：SubAgent 已结束/中断但已有可恢复的 `worktree_path` / `source_branch` / `source_commit` / `validation`，需要 integrator 接手恢复合并。
 - `merged`：worker 已自行合并目标分支。
 - `blocked`：worker 或 integrator 报告阻塞。
 
-启动/恢复 hook 会在 `startup|resume` 时修复异常中断遗留状态：无活动证据的 `in_progress` 会恢复为 `ready`，无活动证据或陈旧 lock 的 `merging` 会恢复为 `merge_pending`，并写入 notes。
+Hook 生命周期约定：
+- `SubagentStart` 是正常接管入口：它会从启动参数或 prompt 中提取 REQ id，写入 `owner_agent`、`agent_type`、`started_at`、`heartbeat_at`；如果 REQ 是 `ready`，会转为 `in_progress`。
+- `SubagentStop` 是正常结束入口：它优先从 `WTMA_HANDOFF` JSON 中提取 `worktree_path`、`source_branch`、`source_commit`、`validation` 和最终状态，写入 `merge_pending`、`merged` 或 `blocked`；如果 SubAgent 输出 `merge_waiting` 或交接字段不完整，会 block 并要求继续该 SubAgent flow。
+- `Stop` 会在主 Agent 本轮结束前做 ledger 一致性检查；如果存在未落盘的 active 状态或同目标并发合并风险，会 block 主 Agent 过早结束。
+- `SessionStart` 只处理启动/恢复后的异常恢复：stale `in_progress` 无 commit 恢复为 `ready`，stale `in_progress` 有 commit 或 stale `merge_waiting` 恢复为 `merge_pending`，stale `merging` 且无活动 Git marker 时清理陈旧 lock 并恢复为 `merge_pending`。
 
 ## 主 Agent 循环
 
@@ -95,12 +111,13 @@ while (用户需求仍可能有未覆盖面) {
 关键规则：
 - 如果没有 ready 条目，继续调用 explorer 探索更多需求面。
 - 如果有 ready 条目，调用 worker 后立刻继续调用 explorer 或分发下一个 ready 条目。
-- 主 Agent 只用会话内 `called_req_ids` 防止重复调用；需求 md 状态由 worker 自己更新为 `in_progress`、`merging`、`merged`、`merge_pending` 或 `blocked`。
+- 主 Agent 只用会话内 `called_req_ids` 防止重复调用；需求 md 状态由 worker、integrator 和 hook 共同维护为 `in_progress`、`merge_waiting`、`merging`、`merge_pending`、`merged` 或 `blocked`。
 - 如果 SessionStart hook 汇报已恢复状态，立刻重新读取需求 md；恢复成 `ready` 的 REQ 可重新分发，恢复成 `merge_pending` 的 REQ 按 integrator 规则处理。
 - 如果需求 md 中已经存在同一 `merge_target` 的 `merging` 条目，主 Agent 不得再调用新的 integrator 处理同一目标分支；可以继续调用 explorer，或分发 worker 并明确要求其实现提交后等待该 `merging`/lock 清除再合并。
+- 如果需求 md 中存在 `merge_waiting` 条目，说明仍有 SubAgent 在主动等待；主 Agent 不要把它当成新实现任务重复分发，也不要为它启动 integrator。
 - 如果需求 md 中存在 `merge_pending` 条目，主 Agent 最多只调用一个 `worktree-integrator` 处理同一 `merge_target`。调用后继续探索，不再为同一目标启动第二个 integrator。
 - 看到 `Waiting for <agent-id>`、`waitFor`、超时、无回传，都不改变主 Agent 行为：继续调用其他 Agent。
-- 主 Agent 不需要知道 worker 是否完成，除非后续要把 worker 输出交给 integrator 修复合并阻塞。
+- 主 Agent 本轮仍运行时可以读取 worker 返回并据此分发 integrator；本轮结束后由 `SubagentStop` hook 和需求 md 承接状态，不再依赖下一次 `SessionStart` 才恢复。
 
 ## Plan 约束
 
@@ -140,16 +157,19 @@ while (用户需求仍可能有未覆盖面) {
 
 调用 `worktree-worker` 时，必须提供：
 - 需求 md 路径。
-- 具体 REQ id 和条目内容。
-- 建议 worktree/branch 名称。
+- 具体 REQ id 和条目内容；prompt 中必须原样包含 `REQ-...`，便于 hook 识别生命周期事件。
+- 建议 worktree/branch 名称；默认 worktree 根目录为当前仓库父目录下 `<repo-name>.worktrees/`，每个 REQ 使用 `<repo-name>.worktrees/<REQ-id>`，实际路径写入 `worktree_path`。
 - merge_target；如果 unknown，要求 worker 自行安全识别并报告。
 - 验收点和命令。
-- 明确要求 worker 自行更新需求 md 状态、实现、验证、提交，并按 merge lock 协议串行合并目标分支；如果目标分支已有活动 merge/lock，则等待清除后继续拿锁并合并，不得开始第二个 merge，也不得因此立刻结束为 `merge_pending`。
+- 明确要求 worker 自行更新需求 md 状态、实现、验证、提交，并在提交后写入 `worktree_path`、`source_branch`、`source_commit`、`validation`；如果目标分支已有活动 merge/lock，则把 REQ 写为 `merge_waiting` 并等待清除后继续拿锁合并，不得开始第二个 merge，也不得因短暂锁竞争立刻结束为 `merge_pending`。
+- worker 最终输出必须包含一行 `WTMA_HANDOFF { ... }` 单行 JSON，字段至少包括 `req_id`、`status`、`worktree_path`、`source_branch`、`source_commit`、`merge_target`、`validation`。`status` 只能是 `merged`、`merge_pending` 或 `blocked`；如果仍在等待 merge lock，不要结束 SubAgent，也不要输出 `status: merge_waiting` 作为最终 handoff。
 
 调用 `worktree-integrator` 只用于：
 - worker 已实现并提交，但自合并阻塞。
 - 需求 md 中存在 `merge_pending` 且同一 `merge_target` 当前没有 `merging` 条目。
 - 需要专门 Agent 接手合并冲突修复。
+- integrator 必须验证 `worktree_path`、`source_branch` 和 `source_commit` 存在且可达；拿到 merge lock 后写入 `merging`，完成后写入 `merged`，无法自动推进时写入 `blocked`。
+- integrator 最终输出也必须包含 `WTMA_HANDOFF { ... }` 单行 JSON；如果仍在等待 merge lock，继续等待，不要用最终 `merge_waiting` 结束。
 
 ## Git 安全
 

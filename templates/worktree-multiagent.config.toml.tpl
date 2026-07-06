@@ -3,6 +3,33 @@ approval_policy = "on-request"
 sandbox_mode = "workspace-write"
 model_instructions_file = "{{MODEL_INSTRUCTIONS_FILE_TOML}}"
 
+[[hooks.SubagentStart]]
+
+[[hooks.SubagentStart.hooks]]
+type = "command"
+command = "node \"{{STATE_RECOVERY_SCRIPT_TOML}}\""
+commandWindows = "if (Get-Command node -ErrorAction SilentlyContinue) { node \"{{STATE_RECOVERY_SCRIPT_TOML}}\" }"
+timeout = 10
+statusMessage = "Registering worktree REQ owner..."
+
+[[hooks.SubagentStop]]
+
+[[hooks.SubagentStop.hooks]]
+type = "command"
+command = "node \"{{STATE_RECOVERY_SCRIPT_TOML}}\""
+commandWindows = "if (Get-Command node -ErrorAction SilentlyContinue) { node \"{{STATE_RECOVERY_SCRIPT_TOML}}\" }"
+timeout = 10
+statusMessage = "Persisting worktree REQ handoff..."
+
+[[hooks.Stop]]
+
+[[hooks.Stop.hooks]]
+type = "command"
+command = "node \"{{STATE_RECOVERY_SCRIPT_TOML}}\""
+commandWindows = "if (Get-Command node -ErrorAction SilentlyContinue) { node \"{{STATE_RECOVERY_SCRIPT_TOML}}\" }"
+timeout = 10
+statusMessage = "Checking worktree REQ ledger..."
+
 [[hooks.SessionStart]]
 matcher = "startup|resume"
 

@@ -93,7 +93,28 @@ chmod +x ./uninstall.sh
 WORKTREE_MULTIAGENT_REQUIREMENTS.md
 ```
 
-profile 带一个 `SessionStart` hook：启动或 resume 时会把异常中断遗留的 `in_progress` 恢复为 `ready`，把陈旧的 `merging` 恢复为 `merge_pending`，避免队列永久卡住。首次运行时按 Codex 的 hook trust 提示授权即可。
+profile 带一组 hook 控制面，使用同一个 Node 脚本维护需求队列状态：
+
+- `SubagentStart`：登记 SubAgent 接管 REQ，写入 `owner_agent`、`agent_type`、`started_at`、`heartbeat_at`，并把 `ready` 转为 `in_progress`。
+- `SubagentStop`：在 SubAgent 正常结束时优先读取 `WTMA_HANDOFF { ... }` 单行 JSON，记录 `worktree_path`、`source_branch`、`source_commit`、`validation` 和最终状态；输出不完整或把最终状态写成 `merge_waiting` 时会 block，要求继续该 SubAgent flow。
+- `Stop`：主 Agent 本轮结束前检查 ledger 是否有未落盘 active 状态或同目标并发合并风险。
+- `SessionStart`：只做启动或 resume 后的兜底恢复，把 stale `in_progress` / `merge_waiting` / `merging` 转成可重新分发或可恢复合并的状态。
+
+主要状态为 `ready`、`in_progress`、`merge_waiting`、`merging`、`merge_pending`、`merged`、`blocked`。`merge_waiting` 只表示 SubAgent 仍在运行中等待 merge lock，不是最终停止状态。
+
+worker 默认把实现 worktree 放在当前仓库同级目录：
+
+```text
+<repo-parent>/<repo-name>.worktrees/<REQ-id>
+```
+
+最终 handoff 必须包含：
+
+```text
+WTMA_HANDOFF {"req_id":"REQ-...","status":"merge_pending","worktree_path":"...","source_branch":"...","source_commit":"...","merge_target":"main","validation":"..."}
+```
+
+首次运行或 hook 内容变化时按 Codex 的 hook trust 提示授权即可。
 
 ## 设计边界
 
