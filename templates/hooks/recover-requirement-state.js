@@ -15,6 +15,7 @@ const activeMarkers = [
   "rebase-apply",
 ];
 const staleSeconds = Number(process.env.WORKTREE_MULTIAGENT_STALE_SECONDS || "60");
+const worktreeRootSuffix = ".worktrees";
 const lifecycleFields = [
   "owner_agent",
   "agent_type",
@@ -24,6 +25,8 @@ const lifecycleFields = [
   "source_branch",
   "source_commit",
   "validation",
+  "cleanup_status",
+  "cleanup_message",
   "lock_owner",
   "last_agent_message",
 ];
@@ -53,7 +56,157 @@ function gitPath(cwd, flag) {
 }
 
 function repoRoot(cwd) {
-  return gitPath(cwd, "--show-toplevel") || cwd;
+  const root = gitPath(cwd, "--show-toplevel") || cwd;
+  return root && gitWorktreeEntries(root).length ? repositoryLayoutRoot(root) : root;
+}
+
+function repositoryName(root) {
+  return path.basename(path.resolve(root));
+}
+
+function safeWorktreeName(value) {
+  return String(value || "")
+    .trim()
+    .replace(/[^A-Za-z0-9_.-]+/g, "_")
+    .replace(/^[._]+|[._]+$/g, "") || "unknown";
+}
+
+function standardWorktreeRoot(root) {
+  const layoutRoot = path.resolve(repositoryLayoutRoot(root));
+  return path.resolve(path.dirname(layoutRoot), `${repositoryName(layoutRoot)}${worktreeRootSuffix}`);
+}
+
+function standardWorktreePath(root, reqId) {
+  return path.join(standardWorktreeRoot(root), safeWorktreeName(reqId));
+}
+
+function samePath(left, right) {
+  const normalize = (value) => {
+    const normalized = path.normalize(path.resolve(value));
+    return process.platform === "win32" ? normalized.toLowerCase() : normalized;
+  };
+  return normalize(left) === normalize(right);
+}
+
+function gitWorktreeEntries(root) {
+  try {
+    const output = cp.execFileSync("git", ["worktree", "list", "--porcelain"], {
+      cwd: root,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+      timeout: 1500,
+    });
+    const entries = [];
+    let current = null;
+    for (const line of output.split(/\r?\n/)) {
+      if (line.startsWith("worktree ")) {
+        if (current) entries.push(current);
+        current = { path: line.slice("worktree ".length).trim(), branch: "" };
+      } else if (current && line.startsWith("branch ")) {
+        current.branch = line.slice("branch ".length).trim().replace(/^refs\/heads\//, "");
+      }
+    }
+    if (current) entries.push(current);
+    return entries;
+  } catch {
+    return [];
+  }
+}
+
+function repositoryLayoutRoot(root) {
+  const entries = gitWorktreeEntries(root);
+  return entries.length && entries[0].path ? entries[0].path : root;
+}
+
+function branchExists(root, branch) {
+  if (!root || !branch) return false;
+  try {
+    cp.execFileSync("git", ["show-ref", "--verify", "--quiet", `refs/heads/${branch.replace(/^refs\/heads\//, "")}`], {
+      cwd: root,
+      stdio: "ignore",
+      timeout: 2000,
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function cleanupMergedWorktree(root, reqId, fields) {
+  if (!root || !fields.worktreePath || !fields.sourceBranch) {
+    return { status: "skipped", message: "cleanup requires root, worktree_path, and source_branch" };
+  }
+
+  const resolved = resolveWorktreePath(root, fields.worktreePath);
+  const expected = standardWorktreePath(root, reqId);
+  if (!samePath(resolved, expected)) {
+    return {
+      status: "skipped",
+      message: `worktree_path is outside the standard location; expected ${expected}`,
+    };
+  }
+  const sourceBranch = fields.sourceBranch.replace(/^refs\/heads\//, "");
+  const mergeTarget = String(fields.mergeTarget || "").replace(/^refs\/heads\//, "");
+  if (mergeTarget && mergeTarget !== "unknown" && sourceBranch === mergeTarget) {
+    return { status: "failed", message: `refusing to remove merge target worktree/branch ${sourceBranch}` };
+  }
+  if (
+    mergeTarget &&
+    mergeTarget !== "unknown" &&
+    fields.sourceCommit &&
+    gitCommitExists(root, mergeTarget) &&
+    !gitCommitContains(root, fields.sourceCommit, mergeTarget)
+  ) {
+    return { status: "failed", message: `source commit ${fields.sourceCommit} is not merged into ${mergeTarget}` };
+  }
+
+  const commandRoot = repositoryLayoutRoot(root);
+  const entries = gitWorktreeEntries(commandRoot);
+  const entry = entries.find((item) => samePath(item.path, resolved));
+  if (entry && samePath(entry.path, commandRoot)) {
+    return { status: "failed", message: `refusing to remove primary worktree ${commandRoot}` };
+  }
+  if (entry && entry.branch && entry.branch !== sourceBranch) {
+    return { status: "failed", message: `worktree_path is checked out by ${entry.branch}, not ${fields.sourceBranch}` };
+  }
+
+  const details = [];
+  if (entry) {
+    try {
+      cp.execFileSync("git", ["worktree", "remove", "--", resolved], {
+        cwd: commandRoot,
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"],
+        timeout: 4000,
+      });
+      details.push(`removed worktree ${resolved}`);
+    } catch (error) {
+      const message = compactValue(error.stderr || error.message || "git worktree remove failed", 240);
+      return { status: "failed", message: `could not remove worktree ${resolved}: ${message}` };
+    }
+  } else if (fs.existsSync(resolved)) {
+    return { status: "failed", message: `path exists but is not a registered git worktree: ${resolved}` };
+  } else {
+    details.push(`worktree already absent: ${resolved}`);
+  }
+
+  if (branchExists(commandRoot, sourceBranch)) {
+    try {
+      cp.execFileSync("git", ["branch", "-d", "--", sourceBranch], {
+        cwd: commandRoot,
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"],
+        timeout: 2500,
+      });
+      details.push(`deleted merged branch ${sourceBranch}`);
+    } catch (error) {
+      const message = compactValue(error.stderr || error.message || "git branch -d failed", 240);
+      return { status: "partial", message: `worktree removed, branch ${sourceBranch} retained: ${message}` };
+    }
+  } else {
+    details.push(`branch already absent: ${sourceBranch}`);
+  }
+  return { status: "cleaned", message: details.join("; ") };
 }
 
 function gitDirs(root) {
@@ -491,7 +644,8 @@ function parseOutcome(text) {
 
 function resolveWorktreePath(root, value) {
   if (!value) return "";
-  return path.isAbsolute(value) ? value : path.resolve(root || process.cwd(), value);
+  const base = root ? repositoryLayoutRoot(root) : process.cwd();
+  return path.isAbsolute(value) ? value : path.resolve(base, value);
 }
 
 function gitCommitExists(root, rev) {
@@ -524,10 +678,14 @@ function gitCommitContains(root, ancestor, descendant) {
 
 function recoverableFields(block) {
   return {
+    reqId: getField(block, "req_id"),
     worktreePath: getField(block, "worktree_path"),
     sourceBranch: getField(block, "source_branch"),
     sourceCommit: getField(block, "source_commit"),
     validation: getField(block, "validation"),
+    cleanupStatus: getField(block, "cleanup_status"),
+    cleanupMessage: getField(block, "cleanup_message"),
+    mergeTarget: mergeTarget(block),
   };
 }
 
@@ -535,24 +693,32 @@ function hasRecoverableFields(fields) {
   return Boolean(fields.worktreePath && fields.sourceBranch && fields.sourceCommit && fields.validation);
 }
 
-function handoffProblems(root, fields) {
+function handoffProblems(root, fields, options = {}) {
   const problems = [];
+  const cleaned = fields.cleanupStatus === "cleaned" || options.allowCleaned === true;
   if (!fields.worktreePath) problems.push("missing worktree_path");
   if (!fields.sourceBranch) problems.push("missing source_branch");
   if (!fields.sourceCommit) problems.push("missing source_commit");
   if (!fields.validation) problems.push("missing validation");
   if (root && fields.worktreePath) {
     const resolved = resolveWorktreePath(root, fields.worktreePath);
-    if (!fs.existsSync(resolved)) problems.push(`worktree_path does not exist: ${resolved}`);
+    if (fields.reqId && !samePath(resolved, standardWorktreePath(root, fields.reqId))) {
+      problems.push(`worktree_path is not in the standard location: ${resolved}`);
+    }
+    if (!cleaned && !fs.existsSync(resolved)) problems.push(`worktree_path does not exist: ${resolved}`);
   }
   if (root && fields.sourceCommit && !gitCommitExists(root, fields.sourceCommit)) {
     problems.push(`source_commit is not reachable: ${fields.sourceCommit}`);
   }
-  if (root && fields.sourceBranch && !gitCommitExists(root, fields.sourceBranch)) {
+  if (root && options.requireMerged && (!fields.mergeTarget || fields.mergeTarget === "unknown")) {
+    problems.push("merge_target is required to verify a merged handoff");
+  }
+  if (root && fields.sourceBranch && !cleaned && !gitCommitExists(root, fields.sourceBranch)) {
     problems.push(`source_branch is not reachable: ${fields.sourceBranch}`);
   }
   if (
     root &&
+    !cleaned &&
     fields.sourceBranch &&
     fields.sourceCommit &&
     gitCommitExists(root, fields.sourceBranch) &&
@@ -560,6 +726,11 @@ function handoffProblems(root, fields) {
     !gitCommitContains(root, fields.sourceCommit, fields.sourceBranch)
   ) {
     problems.push(`source_commit ${fields.sourceCommit} is not contained in source_branch ${fields.sourceBranch}`);
+  }
+  if (root && (cleaned || options.requireMerged) && fields.mergeTarget && fields.mergeTarget !== "unknown" && fields.sourceCommit) {
+    if (gitCommitExists(root, fields.mergeTarget) && !gitCommitContains(root, fields.sourceCommit, fields.mergeTarget)) {
+      problems.push(`source_commit ${fields.sourceCommit} is not contained in merge_target ${fields.mergeTarget}`);
+    }
   }
   return problems;
 }
@@ -638,6 +809,9 @@ function dispatchSubagentStop(queue, input, root) {
   const sourceBranch = handoffValue(handoff, ["source_branch", "sourceBranch", "branch", "task_branch", "taskBranch"]) || parseBranch(combined) || getField(block, "source_branch");
   const sourceCommit = handoffValue(handoff, ["source_commit", "sourceCommit", "commit", "commit_id", "commitId"]) || parseCommit(combined) || getField(block, "source_commit");
   const validation = handoffValue(handoff, ["validation", "validation_result", "validationResult", "tests", "test_result", "testResult"]) || parseValidation(combined) || getField(block, "validation");
+  const handoffMergeTarget = handoffValue(handoff, ["merge_target", "mergeTarget", "target_branch", "targetBranch"]) || getField(block, "merge_target");
+  const cleanupStatus = handoffValue(handoff, ["cleanup_status", "cleanupStatus", "worktree_cleanup", "worktreeCleanup"]) || getField(block, "cleanup_status");
+  const cleanupMessage = handoffValue(handoff, ["cleanup_message", "cleanupMessage"]) || getField(block, "cleanup_message");
   const summary = compactValue(message || combined, 360);
   const changes = [];
 
@@ -649,18 +823,37 @@ function dispatchSubagentStop(queue, input, root) {
   if (sourceBranch) setField(block, "source_branch", sourceBranch);
   if (sourceCommit) setField(block, "source_commit", sourceCommit);
   if (validation) setField(block, "validation", validation);
+  if (handoffMergeTarget) setField(block, "merge_target", handoffMergeTarget);
+  if (cleanupStatus) setField(block, "cleanup_status", cleanupStatus);
+  if (cleanupMessage) setField(block, "cleanup_message", cleanupMessage);
 
-  const fields = { worktreePath, sourceBranch, sourceCommit, validation };
-  const problems = handoffProblems(root, fields);
+  const fields = {
+    reqId,
+    worktreePath,
+    sourceBranch,
+    sourceCommit,
+    validation,
+    cleanupStatus,
+    cleanupMessage,
+    mergeTarget: handoffMergeTarget || mergeTarget(block),
+  };
+  const problems = handoffProblems(root, fields, {
+    allowCleaned: outcome === "merged" && cleanupStatus === "cleaned",
+    requireMerged: outcome === "merged",
+  });
   if (outcome === "merged") {
     if (problems.length) {
       return {
         block: blockOutput("SubagentStop", `SubagentStop for ${reqId} reported merged but has an invalid WTMA handoff:\n- ${problems.join("\n- ")}`),
       };
     }
+    const cleanup = cleanupMergedWorktree(root, reqId, fields);
+    setField(block, "cleanup_status", cleanup.status);
+    setField(block, "cleanup_message", cleanup.message);
     replaceStatus(block, "merged");
-    addNote(block, `SubagentStop hook recorded ${owner} as merged.`);
+    addNote(block, `SubagentStop hook recorded ${owner} as merged; cleanup ${cleanup.status}: ${cleanup.message}.`);
     changes.push(`${reqId}: -> merged`);
+    changes.push(`${reqId}: worktree cleanup -> ${cleanup.status}`);
     return { changes };
   }
   if (outcome === "blocked") {
@@ -733,7 +926,17 @@ function dispatchSessionStart(queue, root, now) {
     const block = entry.lines;
     const state = status(block);
     const stale = !hasFreshOwner(block, now);
-    if (state === "in_progress" && stale) {
+    if (state === "merged") {
+      const fields = recoverableFields(block);
+      fields.reqId = entry.reqId;
+      if (fields.worktreePath && fields.sourceBranch && fields.cleanupStatus !== "cleaned") {
+        const cleanup = cleanupMergedWorktree(root, entry.reqId, fields);
+        setField(block, "cleanup_status", cleanup.status);
+        setField(block, "cleanup_message", cleanup.message);
+        addNote(block, `SessionStart retried merged worktree cleanup: ${cleanup.status}: ${cleanup.message}.`);
+        changes.push(`${entry.reqId}: worktree cleanup -> ${cleanup.status}`);
+      }
+    } else if (state === "in_progress" && stale) {
       const fields = recoverableFields(block);
       if (hasRecoverableFields(fields)) {
         replaceStatus(block, "merge_pending");

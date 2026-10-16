@@ -96,22 +96,40 @@ WORKTREE_MULTIAGENT_REQUIREMENTS.md
 profile 带一组 hook 控制面，使用同一个 Node 脚本维护需求队列状态：
 
 - `SubagentStart`：登记 SubAgent 接管 REQ，写入 `owner_agent`、`agent_type`、`started_at`、`heartbeat_at`，并把 `ready` 转为 `in_progress`。
-- `SubagentStop`：在 SubAgent 正常结束时优先读取 `WTMA_HANDOFF { ... }` 单行 JSON，记录 `worktree_path`、`source_branch`、`source_commit`、`validation` 和最终状态；输出不完整或把最终状态写成 `merge_waiting` 时会 block，要求继续该 SubAgent flow。
+- `SubagentStop`：在 SubAgent 正常结束时优先读取 `WTMA_HANDOFF { ... }` 单行 JSON，记录 `worktree_path`、`source_branch`、`source_commit`、`validation` 和最终状态；标记 `merged` 后记录 `cleanup_status` / `cleanup_message` 并清理标准 worktree；输出不完整或把最终状态写成 `merge_waiting` 时会 block，要求继续该 SubAgent flow。
 - `Stop`：主 Agent 本轮结束前检查 ledger 是否有未落盘 active 状态或同目标并发合并风险。
-- `SessionStart`：只做启动或 resume 后的兜底恢复，把 stale `in_progress` / `merge_waiting` / `merging` 转成可重新分发或可恢复合并的状态。
+- `SessionStart`：只做启动或 resume 后的兜底恢复，把 stale `in_progress` / `merge_waiting` / `merging` 转成可重新分发或可恢复合并的状态，并重试已合并条目的未完成清理。
 
 主要状态为 `ready`、`in_progress`、`merge_waiting`、`merging`、`merge_pending`、`merged`、`blocked`。`merge_waiting` 只表示 SubAgent 仍在运行中等待 merge lock，不是最终停止状态。
 
-worker 默认把实现 worktree 放在当前仓库同级目录：
+## 标准 worktree 布局与清理
+
+worker 和 integrator 必须使用当前仓库同级的标准目录，不能把任务 worktree 放进主仓库目录：
 
 ```text
 <repo-parent>/<repo-name>.worktrees/<REQ-id>
 ```
 
+每个 REQ 使用自己的目录和 `wtma/<REQ-id>` 任务分支。`worktree_path` 必须记录这个实际绝对路径（或相对于仓库根目录的路径），不能临时改用其他目录。
+
+创建示例：
+
+```bash
+git worktree add --branch wtma/<REQ-id> <repo-parent>/<repo-name>.worktrees/<REQ-id> <merge-target>
+```
+
+成功合并并完成合并后验证后，`SubagentStop` hook 会安全执行：
+
+1. 使用不带 `--force` 的 `git worktree remove` 移除该标准 worktree。
+2. 使用 `git branch -d` 删除已经合并的任务分支。
+3. 在需求条目写入 `cleanup_status` 和 `cleanup_message`。
+
+worktree 有未提交改动、路径不是标准目录或分支仍未安全合并时，不会强制删除；条目会保留清理结果，后续 `SessionStart` 会重试。
+
 最终 handoff 必须包含：
 
 ```text
-WTMA_HANDOFF {"req_id":"REQ-...","status":"merge_pending","worktree_path":"...","source_branch":"...","source_commit":"...","merge_target":"main","validation":"..."}
+WTMA_HANDOFF {"req_id":"REQ-...","status":"merged","worktree_path":"...","source_branch":"wtma/REQ-...","source_commit":"...","merge_target":"main","validation":"..."}
 ```
 
 首次运行或 hook 内容变化时按 Codex 的 hook trust 提示授权即可。

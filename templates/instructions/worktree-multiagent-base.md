@@ -68,6 +68,8 @@ worktree_path: <实际 git worktree 目录>
 source_branch: <实现分支>
 source_commit: <实现提交>
 validation: <最后一次关键验证命令和结果>
+cleanup_status: <pending / cleaned / partial / failed / skipped>
+cleanup_message: <worktree 和任务分支清理结果>
 lock_owner: <持有 merge lock 的 Agent id>
 last_agent_message: <最后一次 SubAgent 交接摘要>
 acceptance:
@@ -84,14 +86,14 @@ notes:
 - `merge_waiting`：已实现、验证、提交，`worktree_path` / `source_branch` / `source_commit` / `validation` 已记录，SubAgent 仍在运行并等待同目标 merge lock 或活动 merge 清除；SubAgentStop 不应把最终状态落成 `merge_waiting`。
 - `merging`：某个 worker/integrator 已获得该目标分支的 merge lock，正在合并。主 Agent 不得再调用任何会合并同一目标分支的 Agent。
 - `merge_pending`：SubAgent 已结束/中断但已有可恢复的 `worktree_path` / `source_branch` / `source_commit` / `validation`，需要 integrator 接手恢复合并。
-- `merged`：worker 已自行合并目标分支。
+- `merged`：worker 已合并目标分支；`SubagentStop` hook 会清理标准 worktree 和已合并任务分支，并记录 `cleanup_status`。
 - `blocked`：worker 或 integrator 报告阻塞。
 
 Hook 生命周期约定：
 - `SubagentStart` 是正常接管入口：它会从启动参数或 prompt 中提取 REQ id，写入 `owner_agent`、`agent_type`、`started_at`、`heartbeat_at`；如果 REQ 是 `ready`，会转为 `in_progress`。
-- `SubagentStop` 是正常结束入口：它优先从 `WTMA_HANDOFF` JSON 中提取 `worktree_path`、`source_branch`、`source_commit`、`validation` 和最终状态，写入 `merge_pending`、`merged` 或 `blocked`；如果 SubAgent 输出 `merge_waiting` 或交接字段不完整，会 block 并要求继续该 SubAgent flow。
+- `SubagentStop` 是正常结束入口：它优先从 `WTMA_HANDOFF` JSON 中提取 `worktree_path`、`source_branch`、`source_commit`、`validation` 和最终状态，写入 `merge_pending`、`merged` 或 `blocked`；标记 `merged` 后会安全清理标准 worktree 和已合并任务分支；如果 SubAgent 输出 `merge_waiting` 或交接字段不完整，会 block 并要求继续该 SubAgent flow。
 - `Stop` 会在主 Agent 本轮结束前做 ledger 一致性检查；如果存在未落盘的 active 状态或同目标并发合并风险，会 block 主 Agent 过早结束。
-- `SessionStart` 只处理启动/恢复后的异常恢复：stale `in_progress` 无 commit 恢复为 `ready`，stale `in_progress` 有 commit 或 stale `merge_waiting` 恢复为 `merge_pending`，stale `merging` 且无活动 Git marker 时清理陈旧 lock 并恢复为 `merge_pending`。
+- `SessionStart` 只处理启动/恢复后的异常恢复：stale `in_progress` 无 commit 恢复为 `ready`，stale `in_progress` 有 commit 或 stale `merge_waiting` 恢复为 `merge_pending`，stale `merging` 且无活动 Git marker 时清理陈旧 lock 并恢复为 `merge_pending`，已 `merged` 但清理失败的条目会重试 worktree/分支清理。
 
 ## 主 Agent 循环
 
@@ -158,18 +160,19 @@ while (用户需求仍可能有未覆盖面) {
 调用 `worktree-worker` 时，必须提供：
 - 需求 md 路径。
 - 具体 REQ id 和条目内容；prompt 中必须原样包含 `REQ-...`，便于 hook 识别生命周期事件。
-- 建议 worktree/branch 名称；默认 worktree 根目录为当前仓库父目录下 `<repo-name>.worktrees/`，每个 REQ 使用 `<repo-name>.worktrees/<REQ-id>`，实际路径写入 `worktree_path`。
+- 必须使用规范 worktree/branch：worktree 根目录为当前仓库父目录下 `<repo-name>.worktrees/`，每个 REQ 使用 `<repo-name>.worktrees/<REQ-id>`，任务分支使用 `wtma/<REQ-id>`，实际路径写入 `worktree_path`。
+- 创建时使用 `git worktree add --branch wtma/<REQ-id> <repo-parent>/<repo-name>.worktrees/<REQ-id> <merge-target>`，并在需求 md 记录实际路径。
 - merge_target；如果 unknown，要求 worker 自行安全识别并报告。
 - 验收点和命令。
-- 明确要求 worker 自行更新需求 md 状态、实现、验证、提交，并在提交后写入 `worktree_path`、`source_branch`、`source_commit`、`validation`；如果目标分支已有活动 merge/lock，则把 REQ 写为 `merge_waiting` 并等待清除后继续拿锁合并，不得开始第二个 merge，也不得因短暂锁竞争立刻结束为 `merge_pending`。
-- worker 最终输出必须包含一行 `WTMA_HANDOFF { ... }` 单行 JSON，字段至少包括 `req_id`、`status`、`worktree_path`、`source_branch`、`source_commit`、`merge_target`、`validation`。`status` 只能是 `merged`、`merge_pending` 或 `blocked`；如果仍在等待 merge lock，不要结束 SubAgent，也不要输出 `status: merge_waiting` 作为最终 handoff。
+- 明确要求 worker 自行更新需求 md 状态、实现、验证、提交，并在提交后写入 `worktree_path`、`source_branch`、`source_commit`、`validation`；成功合并后保留这些字段，让 `SubagentStop` hook 清理规范 worktree 和任务分支；如果目标分支已有活动 merge/lock，则把 REQ 写为 `merge_waiting` 并等待清除后继续拿锁合并，不得开始第二个 merge，也不得因短暂锁竞争立刻结束为 `merge_pending`。
+- worker 最终输出必须包含一行 `WTMA_HANDOFF { ... }` 单行 JSON，字段至少包括 `req_id`、`status`、`worktree_path`、`source_branch`、`source_commit`、`merge_target`、`validation`；可以附带 `cleanup_status` 和 `cleanup_message`。`status` 只能是 `merged`、`merge_pending` 或 `blocked`；如果仍在等待 merge lock，不要结束 SubAgent，也不要输出 `status: merge_waiting` 作为最终 handoff。
 
 调用 `worktree-integrator` 只用于：
 - worker 已实现并提交，但自合并阻塞。
 - 需求 md 中存在 `merge_pending` 且同一 `merge_target` 当前没有 `merging` 条目。
 - 需要专门 Agent 接手合并冲突修复。
 - integrator 必须验证 `worktree_path`、`source_branch` 和 `source_commit` 存在且可达；拿到 merge lock 后写入 `merging`，完成后写入 `merged`，无法自动推进时写入 `blocked`。
-- integrator 最终输出也必须包含 `WTMA_HANDOFF { ... }` 单行 JSON；如果仍在等待 merge lock，继续等待，不要用最终 `merge_waiting` 结束。
+- integrator 最终输出也必须包含 `WTMA_HANDOFF { ... }` 单行 JSON，并在可用时附带 `cleanup_status` 和 `cleanup_message`；如果仍在等待 merge lock，继续等待，不要用最终 `merge_waiting` 结束。
 
 ## Git 安全
 

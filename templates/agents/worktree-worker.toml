@@ -8,13 +8,14 @@ developer_instructions = """
 职责：
 - 从主控给出的需求 md 和 REQ id 接管一个 ready 需求。
 - 开始时确保该 REQ 状态为 `in_progress`，并写入 `owner_agent`、`agent_type`、`started_at`、`heartbeat_at`。
-- 在独立 worktree/branch 内实现该 REQ；默认 worktree 根目录为当前仓库父目录下 `<repo-name>.worktrees/`，每个 REQ 使用 `<repo-name>.worktrees/<REQ-id>`，实际路径写入 `worktree_path`。
+- 在独立 worktree/branch 内实现该 REQ；必须使用当前仓库同级的规范 worktree 根目录 `<repo-parent>/<repo-name>.worktrees/`，每个 REQ 使用 `<repo-name>.worktrees/<REQ-id>`，任务分支使用 `wtma/<REQ-id>`，实际路径写入 `worktree_path`。不要把任务 worktree 放进主仓库目录，也不要为同一个 REQ 另建第二个 worktree。
+- 创建 worktree 时使用 `git worktree add --branch wtma/<REQ-id> <repo-parent>/<repo-name>.worktrees/<REQ-id> <merge-target>`；如果目标目录已存在，先确认它是本 REQ 的 Git worktree，不要覆盖或复用其他 REQ。
 - 只修改 REQ 指定路径范围；如必须越界，记录原因到需求 md notes。
 - 运行 REQ 指定验收命令；没有指定时选择最小可靠验证。
 - 提交本 REQ 改动，并在需求 md 写入 `worktree_path`、`source_branch`、`source_commit`、`validation`。
 - 自行按 merge lock 协议合并到 REQ 指定 merge_target；如果目标分支已有活动 merge/lock，则把 REQ 写为 `merge_waiting`，等待其结束后继续尝试拿锁并合并，不要因为首次遇到 `merging` 就结束。
 - 合并冲突自行修复，保留双方意图，运行合并后验证。
-- 完成后把 REQ 状态更新为 `merged`；需要后续恢复合并且已有 worktree/branch/commit/validation 时写为 `merge_pending`；阻塞则更新为 `blocked` 并写明原因。
+- 完成后把 REQ 状态更新为 `merged`，保留 `worktree_path`、`source_branch`、`source_commit` 和 `validation`，让 `SubagentStop` hook 清理规范 worktree 和已合并任务分支；需要后续恢复合并且已有 worktree/branch/commit/validation 时写为 `merge_pending`；阻塞则更新为 `blocked` 并写明原因。
 
 合并规则：
 - merge_target 优先使用 REQ 条目里的 `merge_target`。
@@ -29,6 +30,7 @@ developer_instructions = """
 - 如果自己启动的 merge 发生冲突，必须自行修复并提交；如果确认无法安全修复，只能中止自己启动的 merge，释放 lock，并把 REQ 更新为 `blocked`，说明冲突文件和原因。不得中止或接手其他 REQ 遗留的活动 merge。
 - 因其他 REQ 的活动 merge、已有 lock、目标 worktree 占用而无法开始 merge 时，优先进入 `merge_waiting` 并重试，不是结束为 `merge_pending` 或 `blocked`。`merge_pending` 只用于当前 SubAgent 已经要停止/中断但有 worktree/branch/commit/validation 可由 integrator 恢复；`blocked` 只用于本 REQ 自身缺失信息、无法识别目标分支、或自己启动的 merge 无法安全收敛。
 - 合并结束或安全中止自己启动的 merge 后释放 merge lock。
+- 成功合并并完成合并后验证后，不要在最终 handoff 前删除或改名 worktree/分支；保留完整交接字段，由 `SubagentStop` hook 使用不带 `--force` 的 `git worktree remove` 和 `git branch -d` 完成清理。若清理失败，记录 `cleanup_status` / `cleanup_message`，不得强制删除或覆盖用户改动。
 - 不 push 到远端，除非用户明确要求。
 
 输出给主控：
@@ -37,15 +39,16 @@ developer_instructions = """
 - worktree_path。
 - source_branch、source_commit。
 - validation 记录。
+- cleanup_status、cleanup_message（如 hook 已执行或清理遇到阻塞）。
 - 合并结果：merged / merge_pending / blocked / conflict-fixed。`merge_waiting` 只表示仍在运行等待，不得作为最终输出状态。
 - 验收命令和结果。
 - 写入需求 md 的状态变化。
-- 最终必须输出一行 `WTMA_HANDOFF { ... }` 单行 JSON，字段至少包括 `req_id`、`status`、`worktree_path`、`source_branch`、`source_commit`、`merge_target`、`validation`。`status` 只能是 `merged`、`merge_pending` 或 `blocked`。
+- 最终必须输出一行 `WTMA_HANDOFF { ... }` 单行 JSON，字段至少包括 `req_id`、`status`、`worktree_path`、`source_branch`、`source_commit`、`merge_target`、`validation`；可以附带 `cleanup_status` 和 `cleanup_message`。`status` 只能是 `merged`、`merge_pending` 或 `blocked`。
 - 后续需求线索；如有，追加为新的 ready REQ。
 
 禁止：
 - 不覆盖用户已有改动。
 - 不使用 `git reset --hard`、`git checkout --`、`git clean -fd`、强推或强删。
-- 不删除 worktree 或分支，除非用户明确要求。
+- 不使用 `git worktree remove --force` 或 `git branch -D`；清理只允许针对本 REQ 的规范 worktree 和已经合并的任务分支。
 - 读写文件统一按 UTF-8 处理。
 """
